@@ -2,12 +2,18 @@ import json
 import random
 import os
 import asyncio
+import logging
 from typing import Dict, List, Any, Optional
 import traceback
 import openai
-from behavior import BehaviorFactory, MoveToBehavior
+from behavior import BehaviorFactory, MoveToBehavior, ExploreBehavior, PatrolBehavior, SearchBehavior
 from drone import MoveAction
 from event_system import EventCallback, Event
+from environment import Position
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("LLMController")
 
 class LLMController:
     """Controller for integrating LLM with the simulation"""
@@ -34,163 +40,178 @@ class LLMController:
         """Process a natural language goal and generate JSON commands for drones"""
         self.environment = environment
         
+        logger.info(f"Processing goal: {goal_text}")
+        
         if use_mock:
-            print(f"Processing goal: {goal_text}")
-            print("LLM would normally generate commands for the drones here")
+            logger.info("Using mock LLM - would normally generate commands for the drones here")
             
-            # For demonstration, create a mock JSON command
-            if drones:
-                drone_id = drones[0].drone_id
-                command_json = {
-                    "command_type": "move",
-                    "target": {
-                        "drone_id": drone_id
-                    },
-                    "parameters": {
-                        "movements": [
-                            {"direction": "up", "steps": 2},
-                            {"direction": "right", "steps": 3}
-                        ]
-                    }
-                }
-                
-                try:
-                    self.execute_json_command(command_json, environment, drones)
-                    print(f"Successfully issued command: {json.dumps(command_json, indent=2)}")
-                except Exception as e:
-                    print(f"Error issuing command: {e}")
+            # Create an ExploreBehavior for all drones as a mock response
+            for drone in drones:
+                explore_behavior = ExploreBehavior(steps=-1)  # Explore indefinitely
+                drone.set_behavior(explore_behavior)
+                logger.info(f"Set drone {drone.drone_id} to explore behavior")
             
-            return {"status": "success", "message": "Drones are searching the environment"}
+            return {"status": "success", "message": "Drones are now exploring the environment"}
         
         # Real LLM implementation
         try:
-            # Check if this is a movement command
-            if self._is_likely_movement_command(goal_text):
-                command_json = await self._generate_command_json(goal_text, drones)
-                
-                if command_json:
-                    try:
-                        self.execute_json_command(command_json, environment, drones)
-                        print(f"Successfully issued command: {json.dumps(command_json, indent=2)}")
-                        return {"status": "success", "message": "Command executed successfully"}
-                    except Exception as e:
-                        print(f"Error executing command: {e}")
-                        traceback.print_exc()
-                        return {"status": "error", "message": f"Error executing command: {str(e)}"}
-                else:
-                    return {"status": "error", "message": "Could not parse command"}
+            # Generate the behavior command
+            behavior_command = await self._generate_behavior_command(goal_text, drones, environment)
+            
+            if behavior_command:
+                try:
+                    self.execute_behavior_command(behavior_command, environment, drones)
+                    logger.info(f"Successfully executed command: {json.dumps(behavior_command, indent=2)}")
+                    return {"status": "success", "message": "Command executed successfully"}
+                except Exception as e:
+                    logger.error(f"Error executing command: {e}")
+                    traceback.print_exc()
+                    return {"status": "error", "message": f"Error executing command: {str(e)}"}
             else:
-                # For higher-level goals, we would have more complex planning logic
-                return {"status": "info", "message": "Currently only supporting movement commands"}
+                return {"status": "error", "message": "Could not parse command"}
                 
         except Exception as e:
-            print(f"Error in LLM processing: {e}")
+            logger.error(f"Error in LLM processing: {e}")
             traceback.print_exc()
             return {"status": "error", "message": f"Error processing command: {str(e)}"}
     
-    def _is_likely_movement_command(self, text: str) -> bool:
-        """Determine if text is likely a movement command"""
-        movement_keywords = ["move", "go", "take", "send", "navigate", "direct", "guide", "fly", "left", 
-                            "right", "up", "down", "north", "south", "east", "west"]
-        drone_keywords = ["drone", "uav", "quadcopter", "copter"]
-        
-        text_lower = text.lower()
-        has_movement = any(keyword in text_lower for keyword in movement_keywords)
-        has_drone = any(keyword in text_lower for keyword in drone_keywords)
-        
-        return has_movement and has_drone
-    
-    async def _generate_command_json(self, command_text: str, drones: List) -> Optional[Dict]:
-        """Use LLM to parse natural language command into JSON format"""
+    async def _generate_behavior_command(self, goal_text: str, drones: List, environment) -> Optional[Dict]:
+        """Use LLM to generate appropriate behavior commands based on goal"""
         # Create a prompt for the LLM
-        system_prompt = self._generate_command_system_prompt(drones)
-        user_prompt = command_text
+        system_prompt = self._generate_goal_system_prompt(drones, environment)
+        user_prompt = goal_text
+        
+        logger.info("Generating LLM prompt for behavior planning")
         
         if not self.api_key:
             # Fallback to simple parsing for testing without API key
-            return self._simple_command_parser(command_text, drones)
+            logger.warning("No API key available - using simple fallback command generation")
+            return self._simple_goal_parser(goal_text, drones)
         
         try:
             # Make the API call to OpenAI
+            logger.info("Calling OpenAI API")
             response = await self._call_openai_api(system_prompt, user_prompt)
+            logger.info(f"Received LLM response: {json.dumps(response, indent=2)}")
             return response
         except Exception as e:
-            print(f"Error calling OpenAI API: {e}")
+            logger.error(f"Error calling OpenAI API: {e}")
             traceback.print_exc()
             return None
     
-    def _generate_command_system_prompt(self, drones: List) -> str:
-        """Generate a system prompt for the LLM to parse natural language into JSON commands"""
+    def _generate_goal_system_prompt(self, drones: List, environment) -> str:
+        """Generate a system prompt for the LLM to plan behaviors based on goals"""
         available_drones = ", ".join([f"drone{drone.drone_id}" for drone in drones])
+        env_width = environment.width
+        env_height = environment.height
         
-        system_prompt = f"""You are a command interpreter for a drone control system. Your task is to translate natural language
-commands into structured JSON commands that the system can understand.
+        system_prompt = f"""You are a drone swarm controller that translates high-level goals into specific behaviors for drones.
+Your task is to analyze the user's goal and generate appropriate behavior commands for the drones.
 
-Available drones: {available_drones}
+ENVIRONMENT INFORMATION:
+- Grid size: {env_width}x{env_height}
+- Available drones: {available_drones}
 
-You must respond with a valid JSON object that follows this structure:
+AVAILABLE BEHAVIORS:
+1. "explore" - Random exploration of the environment
+   Parameters: steps (optional, -1 for indefinite)
+   
+2. "move_to" - Move to a specific position
+   Parameters: x (0-{env_width-1}), y (0-{env_height-1})
+   
+3. "patrol" - Patrol between multiple waypoints
+   Parameters: waypoints (list of positions), loops (optional, -1 for indefinite)
+   
+4. "search" - Systematic search with periodic scanning
+   Parameters: steps_between_scans, scan_range, max_steps (optional)
+
+You must respond with a valid JSON object that follows one of these structures:
+
+For explore behavior:
 ```json
 {{
-    "command_type": "move",
-    "target": {{
-        "drone_id": <drone_id_number>
-    }},
-    "parameters": {{
-        "movements": [
-            {{"direction": "<direction>", "steps": <number_of_steps>}},
+    "behavior_type": "explore",
+    "targets": [
+        {{"drone_id": <drone_id_number>}},
         ...
-        ]
+        ],
+    "parameters": {{
+        
     }}
 }}
 ```
 
-Where:
-- <drone_id_number> is the numeric ID of the drone (1, 2, 3, etc.)
-- <direction> is one of: "up", "down", "left", "right"
-- <number_of_steps> is a positive integer representing the number of grid cells to move
-
-Examples:
-- "move drone1 up 3 steps" would translate to:
+For move_to behavior:
 ```json
 {{
-    "command_type": "move",
-    "target": {{
-        "drone_id": 1
-    }},
+    "behavior_type": "move_to",
+    "targets": [
+        {{"drone_id": <drone_id_number>}},
+        ...
+        ],
     "parameters": {{
-        "movements": [
-            {{"direction": "up", "steps": 3}}
-        ]
+        "x": <x_coordinate>,
+        "y": <y_coordinate>
     }}
 }}
 ```
-
-- "take drone two left 2 units and down 4 cells" would translate to:
+For patrol behavior:
 ```json
 {{
-    "command_type": "move",
-    "target": {{
-        "drone_id": 2
-    }},
+    "behavior_type": "patrol",
+    "targets": [
+        {{"drone_id": <drone_id_number>}},
+        ...
+        ],
     "parameters": {{
-        "movements": [
-            {{"direction": "left", "steps": 2}},
-            {{"direction": "down", "steps": 4}}
-        ]
+        "waypoints": [
+            {{"x": <x1>, "y": <y1>}},
+            {{"x": <x2>, "y": <y2>}},
+            ...
+        ],
+        "loops": <number_of_loops_or_-1>
     }}
 }}
+```
+For search behavior:
+```json
+{{
+    "behavior_type": "search",
+    "targets": [
+        {{"drone_id": <drone_id_number>}},
+        ...
+    ],
+    "parameters": {{
+        "steps_between_scans": <steps>,
+        "scan_range": <range>,
+        "max_steps": <steps_or_-1>
+    }}
+}}
+```
+You can also specify different behaviors for different drones using multiple commands:
+```json
+[
+    {{behavior_command_1}},
+    {{behavior_command_2}},
+    ...
+]
 ```
 
 RESPONSE FORMAT:
-Provide ONLY the JSON object with no additional text or explanation. Do not include the ```json code block formatting in your response.
-If you cannot understand the command, respond with: {{"error": "Could not parse command"}}
+Provide ONLY the JSON object with no additional text or explanation. Do not include the code block formatting in your response.
+If you cannot understand the goal, respond with: {{"error": "Could not parse goal"}}
 """
+        logger.debug(f"Generated system prompt: {system_prompt}")
         return system_prompt
     
     async def _call_openai_api(self, system_prompt: str, user_prompt: str) -> Dict:
         """Make an API call to OpenAI using the official client"""
         try:
             # Call OpenAI API using async client
+            logger.info("Sending prompt to OpenAI")
+            logger.debug(f"System prompt: {system_prompt}")
+            logger.debug(f"User prompt: {user_prompt}")
+            
             response = await asyncio.to_thread(
                 self.client.chat.completions.create,
                 model="gpt-3.5-turbo",  # or other appropriate model
@@ -204,116 +225,167 @@ If you cannot understand the command, respond with: {{"error": "Could not parse 
             
             # Extract the JSON content from the response
             content = response.choices[0].message.content
+            logger.debug(f"Raw LLM response: {content}")
             return json.loads(content)
             
         except Exception as e:
-            print(f"Error in OpenAI API call: {e}")
+            logger.error(f"Error in OpenAI API call: {e}")
             traceback.print_exc()
             raise
     
-    def _simple_command_parser(self, text: str, drones: List) -> Dict:
-        """A simple rule-based parser for demo purposes when no API key is available"""
+    def _simple_goal_parser(self, text: str, drones: List) -> Dict:
+        """A simple rule-based parser for goals when no API key is available"""
         text = text.lower()
         
-        # Try to identify the drone
-        drone_id = None
-        for i in range(1, len(drones) + 1):
-            # Look for both numeric and word forms
-            patterns = [
-                f"drone {i}", f"drone{i}", f"drone #{i}", 
-                f"drone number {i}", f"drone-{i}"
-            ]
+        # Check for specific goal patterns
+        if any(word in text for word in ["search", "find", "look", "scan", "detect"]):
+            return {
+                "behavior_type": "search",
+                "targets": [{"drone_id": drone.drone_id} for drone in drones],
+                "parameters": {
+                    "steps_between_scans": 2,
+                    "scan_range": 2,
+                    "max_steps": -1
+                }
+            }
+        
+        if any(word in text for word in ["explore", "roam", "wander"]):
+            return {
+                "behavior_type": "explore",
+                "targets": [{"drone_id": drone.drone_id} for drone in drones],
+                "parameters": {
+                    "steps": -1
+                }
+            }
+        
+        if any(word in text for word in ["patrol", "guard", "watch"]):
+            # Create a simple patrol around the center
+            center_x = self.environment.width // 2
+            center_y = self.environment.height // 2
+            radius = min(3, min(center_x, center_y))
             
-            # Add word forms for numbers 1-10
-            number_words = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"]
-            if i <= len(number_words):
-                patterns.extend([
-                    f"drone {number_words[i-1]}", 
-                    f"drone number {number_words[i-1]}"
-                ])
-                
-            if any(pattern in text for pattern in patterns):
-                drone_id = i
-                break
+            return {
+                "behavior_type": "patrol",
+                "targets": [{"drone_id": drone.drone_id} for drone in drones],
+                "parameters": {
+                    "waypoints": [
+                        {"x": center_x - radius, "y": center_y - radius},
+                        {"x": center_x + radius, "y": center_y - radius},
+                        {"x": center_x + radius, "y": center_y + radius},
+                        {"x": center_x - radius, "y": center_y + radius}
+                    ],
+                    "loops": -1
+                }
+            }
         
-        if drone_id is None:
-            return {"error": "Could not determine drone ID"}
-        
-        # Initialize result structure
-        result = {
-            "command_type": "move",
-            "target": {
-                "drone_id": drone_id
-            },
+        # Default to exploration
+        return {
+            "behavior_type": "explore",
+            "targets": [{"drone_id": drone.drone_id} for drone in drones],
             "parameters": {
-                "movements": []
+                "steps": -1
             }
         }
-            
-        # Look for direction words and numbers
-        if "left" in text or "west" in text:
-            steps = self._extract_steps(text, ["left", "west"])
-            if steps > 0:
-                result["parameters"]["movements"].append({"direction": "left", "steps": steps})
-        
-        if "right" in text or "east" in text:
-            steps = self._extract_steps(text, ["right", "east"])
-            if steps > 0:
-                result["parameters"]["movements"].append({"direction": "right", "steps": steps})
-        
-        if "up" in text or "north" in text:
-            steps = self._extract_steps(text, ["up", "north"])
-            if steps > 0:
-                result["parameters"]["movements"].append({"direction": "up", "steps": steps})
-        
-        if "down" in text or "south" in text:
-            steps = self._extract_steps(text, ["down", "south"])
-            if steps > 0:
-                result["parameters"]["movements"].append({"direction": "down", "steps": steps})
-        
-        if not result["parameters"]["movements"]:
-            return {"error": "Could not determine movement directions"}
-            
-        return result
     
-    def _extract_steps(self, text: str, direction_words: List[str]) -> int:
-        """Extract number of steps for a specific direction from text"""
-        # Simple number extraction - would need more sophisticated parsing for a real system
-        import re
-        
-        # Check for each direction word
-        for direction in direction_words:
-            # Try to find a number following the direction word
-            pattern = f"{direction}\s+(\d+)"
-            match = re.search(pattern, text)
-            if match:
-                return int(match.group(1))
+    def execute_behavior_command(self, command_json: Dict, environment, drones: List) -> bool:
+        """Execute a behavior command"""
+        try:
+            # Check if we have multiple commands
+            if isinstance(command_json, list):
+                for cmd in command_json:
+                    self._execute_single_behavior_command(cmd, environment, drones)
+                return True
+            else:
+                return self._execute_single_behavior_command(command_json, environment, drones)
+                
+        except Exception as e:
+            logger.error(f"Error executing behavior command: {e}")
+            traceback.print_exc()
+            return False
+    
+    def _execute_single_behavior_command(self, command_json: Dict, environment, drones: List) -> bool:
+        """Execute a single behavior command"""
+        try:
+            # Get behavior type and parameters
+            behavior_type = command_json.get("behavior_type")
+            targets = command_json.get("targets", [])
+            parameters = command_json.get("parameters", {})
             
-            # Check for word numbers
-            number_words = {
-                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-                "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
-            }
+            if not behavior_type or not targets:
+                logger.error("Invalid command: missing behavior_type or targets")
+                return False
             
-            for word, value in number_words.items():
-                if f"{direction} {word}" in text:
-                    return value
+            # Find target drones
+            target_drones = []
+            for target in targets:
+                drone_id = target.get("drone_id")
+                if not drone_id:
+                    continue
+                    
+                # Find the drone object
+                drone = None
+                for d in drones:
+                    if d.drone_id == drone_id:
+                        drone = d
+                        break
+                
+                if drone:
+                    target_drones.append(drone)
+                else:
+                    logger.warning(f"Drone with ID {drone_id} not found")
+            
+            if not target_drones:
+                logger.error("No valid target drones found")
+                return False
+            
+            # Create and apply behavior
+            for drone in target_drones:
+                behavior = BehaviorFactory.create_behavior(behavior_type, parameters)
+                if behavior:
+                    # Clear existing actions and behaviors
+                    drone.clear_behavior()
+                    drone.clear_actions()
+                    
+                    # Set new behavior
+                    drone.set_behavior(behavior)
+                    logger.info(f"Set drone {drone.drone_id} to {behavior_type} behavior")
+                else:
+                    logger.error(f"Failed to create behavior of type {behavior_type}")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error executing behavior command: {e}")
+            traceback.print_exc()
+            return False
+            
+    # Keep existing methods for backward compatibility
+    def _is_likely_movement_command(self, text: str) -> bool:
+        """Determine if text is likely a movement command"""
+        movement_keywords = ["move", "go", "take", "send", "navigate", "direct", "guide", "fly", "left", 
+                            "right", "up", "down", "north", "south", "east", "west"]
+        drone_keywords = ["drone", "uav", "quadcopter", "copter"]
         
-        return 0
+        text_lower = text.lower()
+        has_movement = any(keyword in text_lower for keyword in movement_keywords)
+        has_drone = any(keyword in text_lower for keyword in drone_keywords)
         
+        return has_movement and has_drone
+    
     def execute_json_command(self, command_json: Dict, environment, drones: List) -> bool:
-        """Execute a JSON command"""
+        """Execute a JSON command (maintained for backward compatibility)"""
         try:
             command_type = command_json.get("command_type")
             
             if command_type == "move":
                 return self._execute_move_command(command_json, environment, drones)
             else:
-                print(f"Unknown command type: {command_type}")
+                logger.warning(f"Unknown command type: {command_type}")
                 return False
                 
         except Exception as e:
-            print(f"Error executing JSON command: {e}")
+            logger.error(f"Error executing JSON command: {e}")
             traceback.print_exc()
             return False
     
@@ -332,7 +404,7 @@ If you cannot understand the command, respond with: {{"error": "Could not parse 
                     break
             
             if not drone:
-                print(f"Drone with ID {drone_id} not found")
+                logger.warning(f"Drone with ID {drone_id} not found")
                 return False
             
             # Clear existing actions and behaviors
@@ -346,68 +418,18 @@ If you cannot understand the command, respond with: {{"error": "Could not parse 
                 steps = movement.get("steps")
                 
                 if direction not in ["up", "down", "left", "right"]:
-                    print(f"Invalid direction: {direction}")
+                    logger.warning(f"Invalid direction: {direction}")
                     continue
                 
                 # Add movement actions to the drone
                 for _ in range(steps):
                     drone.add_action(MoveAction(direction))
             
-            print(f"Command executed: Drone {drone_id} will perform {len(movements)} movement(s)")
+            logger.info(f"Command executed: Drone {drone_id} will perform {len(movements)} movement(s)")
             return True
             
         except Exception as e:
-            print(f"Error executing move command: {e}")
+            logger.error(f"Error executing move command: {e}")
             traceback.print_exc()
             return False
-    
-    def parse_json_instructions(self, json_str: str) -> Dict:
-        """Parse JSON instructions from LLM response"""
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            print("Error parsing JSON instructions")
-            return {}
-
-    def generate_command(self, target_position, drone_id=1):
-        """Generate a JSON command to reach a target position.
-        
-        Args:
-            target_position: Position object with x,y coordinates
-            drone_id: ID of the drone to move (defaults to 1)
             
-        Returns:
-            dict: JSON command to move the drone
-        """
-        # Calculate distances to move vertically and horizontally
-        vertical_dist = target_position.y - self.environment.drones[drone_id-1].position.y
-        horizontal_dist = target_position.x - self.environment.drones[drone_id-1].position.x
-        
-        # Build JSON command
-        command = {
-            "command_type": "move",
-            "target": {
-                "drone_id": drone_id
-            },
-            "parameters": {
-                "movements": []
-            }
-        }
-        
-        # Add vertical movement
-        if vertical_dist != 0:
-            direction = "up" if vertical_dist < 0 else "down"
-            command["parameters"]["movements"].append({
-                "direction": direction,
-                "steps": abs(vertical_dist)
-            })
-            
-        # Add horizontal movement
-        if horizontal_dist != 0:
-            direction = "left" if horizontal_dist < 0 else "right"
-            command["parameters"]["movements"].append({
-                "direction": direction,
-                "steps": abs(horizontal_dist)
-            })
-            
-        return command
