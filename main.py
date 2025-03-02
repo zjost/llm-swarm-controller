@@ -10,6 +10,7 @@ from command_processor import CommandProcessor
 from typing import List, Dict
 import re
 import pygame
+import traceback
 
 class Target(Entity):
     """A simple target entity for drones to find"""
@@ -55,10 +56,6 @@ async def run_simulation():
         detector = Detector(range=args.detection_range)
         drone.set_detector(detector)
         
-        # Set default behavior (explore)
-        explore_behavior = ExploreBehavior(steps=-1)  # Explore indefinitely
-        drone.set_behavior(explore_behavior)
-        
         drones.append(drone)
         environment.add_entity(drone)
     
@@ -103,17 +100,15 @@ async def run_simulation():
     # Initialize the environment
     environment.initialize()
     
-    # Now we just use the LLM to send commands to drones when needed
-    goal = "Search for and find all targets in the environment"
-    try:
-        await llm_controller.process_goal(goal, environment, drones, use_mock=args.mock)
-    except Exception as e:
-        print(f"Error processing goal: {e}")
-        # Continue with simulation even if goal processing fails
+    # Set initial input text to default goal
+    environment.input_text = "Search for and find all targets in the environment"
+    
+    # Set drones to idle initially
+    for drone in drones:
+        drone.clear_behavior()
     
     # MAIN SIMULATION LOOP
     font = pygame.font.SysFont(None, 24)
-    
     clock = pygame.time.Clock()
     
     while environment.running:
@@ -135,13 +130,17 @@ async def run_simulation():
             elif event.type == pygame.KEYDOWN:
                 if environment.input_active:
                     if event.key == pygame.K_RETURN:
-                        # Process the command when Enter is pressed
-                        command = environment.input_text
-                        print(f"Command entered: {command}")
+                        # Process the goal when Enter is pressed
+                        goal = environment.input_text
+                        print(f"New goal received: {goal}")
                         try:
-                            environment.command_processor.process_command(command, environment)
+                            # Process the new goal asynchronously
+                            response = await llm_controller.process_goal(goal, environment, drones, use_mock=args.mock)
+                            if response.get("status") == "error":
+                                print(f"Error from LLM controller: {response.get('message')}")
                         except Exception as e:
-                            print(f"Error processing command: {e}")
+                            print(f"Error processing goal: {e}")
+                            traceback.print_exc()
                         environment.input_text = ""  # Clear the input
                     elif event.key == pygame.K_BACKSPACE:
                         environment.input_text = environment.input_text[:-1]
